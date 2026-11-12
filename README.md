@@ -60,6 +60,16 @@ Low-Level Keyboard Hook 沒有裝置 ID，因此並非逐鍵、可靠的裝置�
 4. 掃描期間以 150 毫秒的按鍵間隔判定同一批輸入，攔截後以 Unicode 重送。
    Enter、Tab 仍是一般按鍵。
 
+### Shift 修補
+
+- 若掃描器第一鍵是 Shift，先補送一次 Shift 放開，避免後續 Unicode 仍受到
+  Windows 的 Shift 按住狀態影響；該鍵後來真正放開時會被攔截，避免重複放開。
+- 左、右 Shift 分別追蹤。已放行按鍵保留按下當時的 Shift／Caps Lock 快照，
+  即使 Raw Input 延後到達，也不會使用放開後的狀態重建前幾個字。
+- 在掃描最後一次按鍵約 225 毫秒後，對同一前景視窗／輸入控制項再確認一次英文模式，
+  避免首個 Shift 的延後處理重新切回中文。這是一次性確認，不會持續鎖定英文。
+- 不使用 Ctrl+A、剪貼簿或強制全大寫；原有大小寫與 Enter／Tab 行為保留。
+
 **注意：**
 
 - 首字修復取決於目標程式處理訊息的時序；Backspace 可能刪到既有文字或組字。
@@ -76,5 +86,14 @@ Low-Level Keyboard Hook 沒有裝置 ID，因此並非逐鍵、可靠的裝置�
 - 隔離 WinForms 輸入控制項測試：IME 由開啟切至關閉、未自動恢復，
   且鍵盤配置維持不變。
 - 實際 Honeywell 掃描器與 MES 系統的行為仍需實機驗收。
+
+回歸測試不安裝鍵盤 Hook、不向使用者視窗送按鍵。輸入法測試只操作自己建立的測試視窗：
+
+```powershell
+dotnet build -c Release
+dotnet run --project .\tests\ScannerGuard.RegressionTests.csproj -- .\bin\Release\net8.0-windows\win-x64\ScannerGuard.dll
+```
+
+可在最後加上本機鍵盤網站匯出的 JSON 路徑，重播原始按鍵紀錄；測試不將該檔案加入儲存庫。
 
 本儲存庫不包含掃描紀錄、條碼資料、個人路徑或編譯產物。

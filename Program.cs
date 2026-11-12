@@ -46,10 +46,17 @@ sealed class RawInputWindow : NativeWindow, IDisposable
     long _activeUntil;
     readonly HashSet<uint> _passedDown = new(); // keys whose down went through, so their up must too
     readonly HashSet<uint> _swallowedDown = new();
+    sealed record PassedKey(KBDLLHOOKSTRUCT Key, byte Shift, bool CapsLock, long Tick);
+    readonly List<PassedKey> _passedKeys = new();
+    readonly System.Windows.Forms.Timer _englishTimer = new();
+    readonly Action<char> _sendCharacter = SendUnicode;
+    readonly Action<ushort> _sendKeyPress = SendKeyPress;
+    readonly Action<ushort> _releaseKey = SendKeyRelease;
     readonly LowLevelProc _hookProc;
     readonly IntPtr _hook;
     readonly IntPtr _enUs = LoadKeyboardLayout("00000409", 0);
-    bool _shift;
+    byte _shiftMask;
+    IntPtr _scanForeground, _scanFocus;
     bool _imeWarningShown;
     bool _inputFailed;
 
@@ -71,11 +78,13 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
         if (_hook == IntPtr.Zero)
             throw new InvalidOperationException($"SetWindowsHookEx failed: {Marshal.GetLastWin32Error()}");
+        _englishTimer.Tick += OnEnglishTimerTick;
         RefreshDevices();
     }
 
     public void Dispose()
     {
+        _englishTimer.Dispose();
         UnhookWindowsHookEx(_hook);
         DestroyHandle();
     }
@@ -149,25 +158,101 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             }
 
             bool scanner = IsScanner(info);
-            if (!scanner) return;
-            if (Environment.TickCount64 > _activeUntil)
-            {
-                // This key was not swallowed (we did not know yet it was the scanner): undo it and resend.
-                _activeUntil = Environment.TickCount64 + ActiveGapMs;
-                bool modifier = kb.VKey is 0x10 or 0xA0 or 0xA1 or 0x11 or 0xA2 or 0xA3 or 0x12 or 0xA4 or 0xA5 or 0x14;
-                if (!modifier) SendKeyPress(0x08); // Backspace removes the leaked char or IME composition symbol
-                // Remove the first leaked composition symbol BEFORE closing the IME.
-                // No restore is scheduled: Microsoft Bopomofo stays in English mode.
-                if (!SetImeEnglish(GetForegroundWindow()) && !_imeWarningShown)
-                {
-                    _imeWarningShown = true;
-                    BeginImeWarning();
-                }
-                HandleScannerKey(new KBDLLHOOKSTRUCT { vkCode = kb.VKey, scanCode = kb.MakeCode }, true);
-            }
-            _activeUntil = Environment.TickCount64 + ActiveGapMs;
+            HandlePassedScannerKey(kb.VKey, kb.MakeCode, (kb.Flags & 2) != 0, scanner);
         }
         finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    void HandlePassedScannerKey(ushort vk, ushort scan, bool extended, bool scanner)
+    {
+        int index = _passedKeys.FindIndex(p => p.Key.scanCode == scan &&
+            ((p.Key.flags & LLKHF_EXTENDED) != 0) == extended);
+        if (index < 0)
+        {
+            if (!scanner) return;
+            throw new InvalidOperationException("Scanner input could not be matched to a keyboard event; stopping to avoid duplicate input.");
+        }
+        var passed = _passedKeys[index];
+        _passedKeys.RemoveAt(index);
+        if (!scanner) return;
+        bool starting = Environment.TickCount64 > _activeUntil;
+        if (starting)
+        {
+            _scanForeground = GetForegroundWindow();
+            _scanFocus = GetFocusedWindow(_scanForeground);
+        }
+        _activeUntil = Environment.TickCount64 + ActiveGapMs;
+
+        if (IsShift(vk))
+        {
+            // Release the already-delivered Shift before emitting Unicode. Its later physical
+            // release must be swallowed, while our own Shift state remains independent.
+            uint id = KeyId(passed.Key);
+            if (_passedDown.Remove(id))
+            {
+                _swallowedDown.Add(id);
+                _releaseKey((ushort)ShiftVirtualKey(passed.Key));
+            }
+        }
+        else if (vk is not (0x11 or 0xA2 or 0xA3 or 0x12 or 0xA4 or 0xA5 or 0x14 or 0x0D or 0x09))
+        {
+            _sendKeyPress(0x08);
+            // Use the state at key-down, not the state after a later Shift-up callback.
+            EmitScannerKey(passed.Key, passed.Shift, passed.CapsLock);
+        }
+        if (starting) EnsureEnglish();
+        ScheduleEnglish();
+    }
+
+    static bool IsShift(uint vk) => vk is 0x10 or 0xA0 or 0xA1;
+
+    static uint ShiftVirtualKey(KBDLLHOOKSTRUCT key) =>
+        key.vkCode == 0xA1 || key.scanCode == 0x36 ? 0xA1u : 0xA0u;
+
+    static uint KeyId(KBDLLHOOKSTRUCT key) =>
+        (IsShift(key.vkCode) ? ShiftVirtualKey(key) : key.vkCode) |
+        ((key.flags & LLKHF_EXTENDED) << 8);
+
+    void TrackShift(KBDLLHOOKSTRUCT key, bool down)
+    {
+        if (!IsShift(key.vkCode)) return;
+        byte bit = ShiftVirtualKey(key) == 0xA1 ? (byte)2 : (byte)1;
+        _shiftMask = down ? (byte)(_shiftMask | bit) : (byte)(_shiftMask & ~bit);
+    }
+
+    void ScheduleEnglish()
+    {
+        _englishTimer.Stop();
+        _englishTimer.Interval = ActiveGapMs + 75;
+        _englishTimer.Start();
+        _activeUntil = Environment.TickCount64 + ActiveGapMs;
+    }
+
+    void OnEnglishTimerTick(object? sender, EventArgs e)
+    {
+        _englishTimer.Stop();
+        if (!_inputFailed) EnsureEnglish();
+    }
+
+    static IntPtr GetFocusedWindow(IntPtr foreground)
+    {
+        uint thread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        if (foreground == IntPtr.Zero || thread == 0) return IntPtr.Zero;
+        var gui = new GUITHREADINFO { cbSize = (uint)Marshal.SizeOf<GUITHREADINFO>() };
+        return GetGUIThreadInfo(thread, ref gui) ? gui.hwndFocus : IntPtr.Zero;
+    }
+
+    void EnsureEnglish()
+    {
+        // A finite scan-completion retry, never a permanent "force English" loop.
+        bool sameTarget = _scanForeground != IntPtr.Zero && _scanFocus != IntPtr.Zero &&
+            GetForegroundWindow() == _scanForeground && GetFocusedWindow(_scanForeground) == _scanFocus;
+        if ((!sameTarget || !SetImeEnglish(_scanForeground)) && !_imeWarningShown)
+        {
+            _imeWarningShown = true;
+            BeginImeWarning(sameTarget ? null :
+                "Input focus changed during scanning. English mode was not forced on the new target.");
+        }
     }
 
     void BeginImeWarning(string? error = null)
@@ -181,7 +266,7 @@ sealed class RawInputWindow : NativeWindow, IDisposable
                 "The target may not support IMM control, or may be running as administrator. " +
                 "Barcode interception remains active."), "ScannerGuard",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            if (error != null) Application.ExitThread();
+            if (_inputFailed) Application.ExitThread();
         };
         timer.Start();
     }
@@ -229,38 +314,47 @@ sealed class RawInputWindow : NativeWindow, IDisposable
     // characters as Unicode packets, which the IME does not convert.
     bool ShouldSwallow(KBDLLHOOKSTRUCT k, bool down)
     {
-        uint id = k.vkCode | ((k.flags & LLKHF_EXTENDED) << 8);
+        TrackShift(k, down);
+        uint id = KeyId(k);
         if (!down && _passedDown.Remove(id))
         {
-            if (k.vkCode is 0x10 or 0xA0 or 0xA1) _shift = false;
             return false;
         }
         bool held = !down && _swallowedDown.Remove(id);
         if (Environment.TickCount64 > _activeUntil && !held)
         {
-            if (down) _passedDown.Add(id);
+            if (down)
+            {
+                _passedDown.Add(id);
+                _passedKeys.RemoveAll(p => Environment.TickCount64 - p.Tick > 1000);
+                if (_passedKeys.Count >= 4096)
+                    throw new InvalidOperationException("Too many unmatched keyboard events; stopping input interception.");
+                _passedKeys.Add(new PassedKey(k, _shiftMask, (GetKeyState(0x14) & 1) != 0, Environment.TickCount64));
+            }
             return false;
         }
         _activeUntil = Environment.TickCount64 + ActiveGapMs;
         if (down) _swallowedDown.Add(id);
-        HandleScannerKey(k, down);
+        if (down) EmitScannerKey(k, _shiftMask, (GetKeyState(0x14) & 1) != 0);
+        ScheduleEnglish();
         return true;
     }
 
-    void HandleScannerKey(KBDLLHOOKSTRUCT k, bool down)
+    void EmitScannerKey(KBDLLHOOKSTRUCT k, byte shift, bool capsLock)
     {
         uint vk = k.vkCode;
-        if (vk is 0x10 or 0xA0 or 0xA1) { _shift = down; return; }
+        if (IsShift(vk)) return;
         if (vk is 0x11 or 0xA2 or 0xA3 or 0x12 or 0xA4 or 0xA5 or 0x14) return;
-        if (!down) return;
 
-        if (vk is 0x0D or 0x09) { SendKeyPress((ushort)vk); return; }
+        if (vk is 0x0D or 0x09) { _sendKeyPress((ushort)vk); return; }
 
         var state = new byte[256];
-        if (_shift) state[0x10] = 0x80;
-        if ((GetKeyState(0x14) & 1) != 0) state[0x14] = 1;
+        if (shift != 0) state[0x10] = 0x80;
+        if ((shift & 1) != 0) state[0xA0] = 0x80;
+        if ((shift & 2) != 0) state[0xA1] = 0x80;
+        if (capsLock) state[0x14] = 1;
         var sb = new System.Text.StringBuilder(4);
-        if (ToUnicodeEx(vk, k.scanCode, state, sb, sb.Capacity, 4, _enUs) == 1) SendUnicode(sb[0]);
+        if (ToUnicodeEx(vk, k.scanCode, state, sb, sb.Capacity, 4, _enUs) == 1) _sendCharacter(sb[0]);
     }
 
     static void SendUnicode(char c)
@@ -283,6 +377,14 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             inputs[i].ki = new KEYBDINPUT { wVk = vk, dwFlags = i == 1 ? 0x2u : 0, dwExtraInfo = Marker };
         }
         SendChecked(inputs);
+    }
+
+    static void SendKeyRelease(ushort vk)
+    {
+        SendChecked(new[]
+        {
+            new INPUT { type = 1, ki = new KEYBDINPUT { wVk = vk, dwFlags = 0x2, dwExtraInfo = Marker } }
+        });
     }
 
     static void SendChecked(INPUT[] inputs)

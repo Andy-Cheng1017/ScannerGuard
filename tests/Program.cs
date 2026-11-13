@@ -10,7 +10,9 @@ internal static class RegressionTests
     [STAThread]
     static int Main(string[] args)
     {
-        var type = Assembly.LoadFrom(Path.GetFullPath(args[0])).GetType("RawInputWindow", true)!;
+        var product = Assembly.LoadFrom(Path.GetFullPath(args[0]));
+        var type = product.GetType("RawInputWindow", true)!;
+        VerifyDeviceClassification(type);
         using (var scanner = new Replay(type))
         {
             Check(!scanner.Key(0xA0, 0x2A, true, rawImmediately: false), "Initial Shift must initially pass.");
@@ -86,6 +88,7 @@ internal static class RegressionTests
         }
         Console.WriteLine("PASS: ordinary keyboard Shift and already-passed Enter are not rewritten.");
         VerifyImeCompletion(type);
+        VerifyTrayAndPowerIntegration(product);
 
         if (args.Length > 1)
         {
@@ -120,6 +123,41 @@ internal static class RegressionTests
     static void Check(bool success, string message)
     {
         if (!success) throw new InvalidOperationException(message);
+    }
+
+    static void VerifyDeviceClassification(Type type)
+    {
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+        var builtIn = type.GetMethod("IsBuiltInKeyboardPath", flags)!;
+        var scanner = type.GetMethod("IsScannerPath", flags)!;
+        const string acpi = @"\\?\ACPI#MSFT0001#4&2a5443e8&0#{GUID}";
+        const string usbScanner = @"\\?\HID#VID_1234&PID_5678&MI_00#7&1#{GUID}";
+        Check((bool)builtIn.Invoke(null, new object[] { acpi })!, "Built-in ACPI keyboard was not recognized.");
+        Check(!(bool)builtIn.Invoke(null, new object[] { usbScanner })!, "USB HID was treated as built-in.");
+        var primary = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { acpi };
+        Check(!(bool)scanner.Invoke(null, new object[] { acpi, primary })!, "Primary keyboard classified as scanner.");
+        Check((bool)scanner.Invoke(null, new object[] { usbScanner, primary })!,
+            "Previously unseen scanner VID/PID was not classified as scanner.");
+        Check(!(bool)scanner.Invoke(null, new object[] { usbScanner, new HashSet<string>() })!,
+            "Unknown primary keyboard caused all devices to be intercepted.");
+        Console.WriteLine("PASS: unseen scanner HID is classified without VID/PID when a primary keyboard is known.");
+    }
+
+    static void VerifyTrayAndPowerIntegration(Assembly product)
+    {
+        Type type = product.GetType("ScannerGuardApplicationContext", true)!;
+        using var context = (ApplicationContext)Activator.CreateInstance(type)!;
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic;
+        var tray = (NotifyIcon)type.GetField("_tray", flags)!.GetValue(context)!;
+        Check(tray.Visible, "Application context did not create its tray icon.");
+        Check(tray.ContextMenuStrip?.Items.OfType<ToolStripMenuItem>().Any(item => item.Text == "Exit") == true,
+            "Tray menu does not expose Exit.");
+        var setPower = type.GetMethod("SetKeepAwake", flags)!;
+        Check((bool)setPower.Invoke(null, new object[] { true })!, "Could not set keep-awake state.");
+        context.ExitThread();
+        Check(!tray.Visible, "Exit did not hide the tray icon.");
+        Check((bool)setPower.Invoke(null, new object[] { false })!, "Could not restore normal power state.");
+        Console.WriteLine("PASS: single-EXE tray icon includes Exit and restores keep-awake state on exit.");
     }
 
     static void VerifyImeCompletion(Type type)

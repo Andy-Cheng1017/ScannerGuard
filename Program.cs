@@ -1,25 +1,76 @@
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 using System.Windows.Forms;
-
-// Usage: ScannerGuard.exe [VID PID]   (default: Honeywell 1900g HID keyboard, 0C2E 0901)
-string scannerVid = args.Length >= 2 ? args[0].ToUpperInvariant() : "0C2E";
-string scannerPid = args.Length >= 2 ? args[1].ToUpperInvariant() : "0901";
 
 using var instance = new Mutex(true, @"Local\ScannerGuard", out bool firstInstance);
 if (!firstInstance) return;
 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
 try
 {
-    using var window = new RawInputWindow(scannerVid, scannerPid);
-    Application.Run();
+    Application.Run(new ScannerGuardApplicationContext());
 }
 catch (Exception ex)
 {
     MessageBox.Show(ex.Message, "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Error);
 }
 
-sealed record DeviceInfo(IntPtr Handle, string Name, string Vid, string Pid);
+sealed class ScannerGuardApplicationContext : ApplicationContext
+{
+    readonly RawInputWindow _window;
+    readonly NotifyIcon _tray;
+    readonly ToolStripMenuItem _status;
+    bool _keepAwake;
+
+    public ScannerGuardApplicationContext()
+    {
+        _status = new ToolStripMenuItem { Enabled = false };
+        _window = new RawInputWindow(UpdateKeyboardStatus);
+        var menu = new ContextMenuStrip();
+        menu.Items.Add(_status);
+        menu.Items.Add(new ToolStripMenuItem("將下一個鍵盤設為一般鍵盤", null,
+            (_, _) => _window.SelectPrimaryOnNextKey()));
+        menu.Items.Add(new ToolStripMenuItem("重新自動偵測內建鍵盤", null,
+            (_, _) => _window.UseAutomaticPrimary()));
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => ExitThread()));
+
+        if (SetKeepAwake(true))
+            _keepAwake = true;
+        else
+            MessageBox.Show("Could not prevent automatic sleep or display timeout.",
+                "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+        _tray = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "ScannerGuard - barcode mode helper",
+            ContextMenuStrip = menu,
+            Visible = true
+        };
+        UpdateKeyboardStatus(_window.KeyboardStatus);
+    }
+
+    void UpdateKeyboardStatus(string status)
+    {
+        _status.Text = status.Length <= 80 ? status : status[..77] + "...";
+    }
+
+    protected override void ExitThreadCore()
+    {
+        _tray.Visible = false;
+        _tray.Dispose();
+        _window.Dispose();
+        if (_keepAwake) SetKeepAwake(false);
+        base.ExitThreadCore();
+    }
+
+    internal static bool SetKeepAwake(bool enabled) =>
+        SetThreadExecutionState(enabled ? 0x80000003 : 0x80000000) != UIntPtr.Zero;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern UIntPtr SetThreadExecutionState(uint flags);
+}
+
+sealed record DeviceInfo(IntPtr Handle, string Name);
 
 sealed class RawInputWindow : NativeWindow, IDisposable
 {
@@ -33,8 +84,9 @@ sealed class RawInputWindow : NativeWindow, IDisposable
     const uint WM_KEYDOWN = 0x0100, WM_SYSKEYDOWN = 0x0104;
     static readonly IntPtr HWND_MESSAGE = new(-3);
 
-    readonly string _vid, _pid;
     readonly Dictionary<IntPtr, DeviceInfo> _devices = new();
+    readonly HashSet<string> _primaryPaths = new(StringComparer.OrdinalIgnoreCase);
+    readonly Action<string> _statusChanged;
     const int WH_KEYBOARD_LL = 13;
     const uint LLKHF_EXTENDED = 0x01, LLKHF_INJECTED = 0x10;
     static readonly UIntPtr Marker = new(0x5343414E); // tags our own injected events
@@ -59,10 +111,12 @@ sealed class RawInputWindow : NativeWindow, IDisposable
     IntPtr _scanForeground, _scanFocus;
     bool _imeWarningShown;
     bool _inputFailed;
+    bool _selectingPrimary;
+    string? _manualPrimaryPath;
 
-    public RawInputWindow(string vid, string pid)
+    public RawInputWindow(Action<string> statusChanged)
     {
-        _vid = vid; _pid = pid;
+        _statusChanged = statusChanged;
         CreateHandle(new CreateParams { Parent = HWND_MESSAGE });
 
         var rid = new RAWINPUTDEVICE
@@ -96,7 +150,32 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         base.WndProc(ref m);
     }
 
-    bool IsScanner(DeviceInfo d) => d.Vid == _vid && d.Pid == _pid;
+    internal string KeyboardStatus => _selectingPrimary
+        ? "等待指定一般鍵盤：請按它的任一鍵"
+        : _primaryPaths.Count > 0
+            ? $"一般鍵盤已辨識 ({_primaryPaths.Count} 個)；其他鍵盤作為掃描器"
+            : "尚未辨識一般鍵盤；請用選單指定";
+
+    internal void UpdateKeyboardStatus() => _statusChanged(KeyboardStatus);
+
+    internal void SelectPrimaryOnNextKey()
+    {
+        _selectingPrimary = true;
+        UpdateKeyboardStatus();
+    }
+
+    internal void UseAutomaticPrimary()
+    {
+        _manualPrimaryPath = null;
+        _selectingPrimary = false;
+        RefreshDevices();
+    }
+
+    internal static bool IsBuiltInKeyboardPath(string name) =>
+        name.StartsWith(@"\\?\ACPI#", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool IsScannerPath(string name, ISet<string> primaryPaths) =>
+        primaryPaths.Count > 0 && !primaryPaths.Contains(name);
 
     void RefreshDevices()
     {
@@ -111,11 +190,20 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         foreach (var d in list.Take((int)count).Where(d => d.dwType == RIM_TYPEKEYBOARD))
         {
             var name = GetDeviceName(d.hDevice);
-            var vid = Regex.Match(name, @"VID_([0-9A-F]{4})", RegexOptions.IgnoreCase).Groups[1].Value.ToUpperInvariant();
-            var pid = Regex.Match(name, @"PID_([0-9A-F]{4})", RegexOptions.IgnoreCase).Groups[1].Value.ToUpperInvariant();
-            var info = new DeviceInfo(d.hDevice, name, vid, pid);
-            _devices[d.hDevice] = info;
+            _devices[d.hDevice] = new DeviceInfo(d.hDevice, name);
         }
+        _primaryPaths.Clear();
+        if (_manualPrimaryPath != null)
+        {
+            if (_devices.Values.Any(device => string.Equals(device.Name, _manualPrimaryPath, StringComparison.OrdinalIgnoreCase)))
+                _primaryPaths.Add(_manualPrimaryPath);
+            else
+                _manualPrimaryPath = null;
+        }
+        if (_manualPrimaryPath == null)
+            foreach (var device in _devices.Values.Where(device => IsBuiltInKeyboardPath(device.Name)))
+                _primaryPaths.Add(device.Name);
+        _statusChanged(KeyboardStatus);
     }
 
     static string GetDeviceName(IntPtr h)
@@ -154,10 +242,16 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             if (!_devices.TryGetValue(dev, out var info))
             {
                 RefreshDevices(); // hot-plugged device
-                if (!_devices.TryGetValue(dev, out info)) info = new DeviceInfo(dev, "?", "????", "????");
+                if (!_devices.TryGetValue(dev, out info)) return;
             }
 
-            bool scanner = IsScanner(info);
+            if (_selectingPrimary)
+            {
+                _manualPrimaryPath = info.Name;
+                _selectingPrimary = false;
+                RefreshDevices();
+            }
+            bool scanner = IsScannerPath(info.Name, _primaryPaths);
             HandlePassedScannerKey(kb.VKey, kb.MakeCode, (kb.Flags & 2) != 0, scanner);
         }
         finally { Marshal.FreeHGlobal(buf); }

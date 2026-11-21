@@ -10,7 +10,7 @@ Windows 11 條碼掃描器背景工具：辨識 USB HID Keyboard 條碼掃描器
 
 雙擊 `ScannerGuard.exe`。程式會在系統匣顯示圖示；右鍵選 `Exit` 可退出。
 
-- 單一 EXE，背景執行，不開啟 Shell、不產生日誌。
+- 單一 EXE，背景執行，不開啟 Shell；另寫入少量診斷日誌。
 - 程式直接呼叫 Windows 電源 API 防止閒置關閉螢幕及自動睡眠，不模擬按鍵。
 - 掃描後微軟注音維持英文；需要中文時自行切換。
 - 右鍵系統匣圖示選 `Exit`，程式會解除防休眠並卸載鍵盤處理。
@@ -20,6 +20,21 @@ Windows 11 條碼掃描器背景工具：辨識 USB HID Keyboard 條碼掃描器
 
 正常運作不顯示視窗；啟動失敗、輸入重送失敗或無法確認輸入法切換時會顯示錯誤／警告。
 若目標系統以系統管理員執行，此工具也需要相同權限。
+
+## 異常退出診斷
+
+日誌位於 `%LOCALAPPDATA%\ScannerGuard\diagnostics.log`，也可從系統匣選單
+「開啟診斷資料夾」開啟。記錄啟動、PID、執行時間、防休眠 API 結果、
+每分鐘 UI 存活訊號、警告、完整例外與退出原因；不記錄按鍵、條碼或目標視窗內容。
+單檔約達 1 MiB 後輪替，保留目前檔案與 `diagnostics.log.1`。
+
+若再次消失，請保留這兩個檔案。`FATAL` 表示程式例外；
+`EXIT_REQUEST source=tray` 表示從選單退出。
+強制終止、斷電或原生崩潰不保證能寫入最後紀錄；突然中斷的 HEARTBEAT
+只能指出最後存活時間，不能單憑它判定是誰終止程式。
+可對照 Windows 事件檢視器的「Windows 記錄 → 應用程式」，
+查看 .NET Runtime（1026）、Application Error（1000）及 Windows Error Reporting（1001）。
+日誌不能取代企業端點防護產品的稽核紀錄，也不會自動重啟程式。
 
 ## 鍵盤與掃描器分類
 
@@ -45,6 +60,16 @@ dotnet publish -c Release -o .\publish
 `publish` 資料夾只需分發 `ScannerGuard.exe`。
 EXE 內含 .NET 執行環境；首次啟動可能解壓原生元件至使用者暫存目錄，
 因此「單檔發佈」不代表執行期間完全不產生執行環境暫存檔。
+
+### GitHub Actions 發布
+
+在 GitHub 的 **Actions → Publish Windows release → Run workflow**，
+選擇要發布的分支，輸入新的版本標籤（例如 `v2026.11.21-diagnostics`）。
+流程在 GitHub Windows runner 建置、執行回歸測試（明確跳過需要前景焦點的 IME 測試），
+再發布壓縮單檔 `ScannerGuard.exe` 與 `SHA256SUMS.txt`。
+使用內建 `GITHUB_TOKEN`，不需要額外 PAT 或本機上傳 EXE。
+已有標籤不會覆寫，Release 會記錄本次建置的原始碼 commit。
+此流程須符合組織核准的原始碼與二進位檔發布政策。
 
 ## 實作與限制
 
@@ -97,5 +122,7 @@ dotnet run --project .\tests\ScannerGuard.RegressionTests.csproj -- .\bin\Releas
 ```
 
 可在最後加上本機鍵盤網站匯出的 JSON 路徑，重播原始按鍵紀錄；測試不將該檔案加入儲存庫。
+無法取得前景焦點的環境可加上 `--no-ime`，明確跳過需要焦點的 IME 測試，其餘測試仍執行。
+診斷測試以子程序驗證正常退出、未處理例外、事件配對失敗、強制終止及日誌輪替。
 
 本儲存庫不包含掃描紀錄、條碼資料、個人路徑或編譯產物。

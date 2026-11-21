@@ -1,0 +1,98 @@
+name: Publish Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "New version tag (for example v2026.11.21-diagnostics)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scannerguard-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Validate new version tag
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9][0-9A-Za-z.-]*$') {
+            throw 'Tag must start with v and a digit, followed only by letters, digits, dots or hyphens.'
+          }
+          $refsJson = gh api "repos/$env:GH_REPO/git/matching-refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check existing tags.' }
+          $refs = $refsJson | ConvertFrom-Json
+          if ($refs | Where-Object { $_.ref -eq "refs/tags/$env:RELEASE_TAG" }) {
+            throw 'This tag already exists. Choose a new version; existing releases are never overwritten.'
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+
+      - name: Regression tests
+        shell: pwsh
+        run: |
+          dotnet run --project .\tests\ScannerGuard.RegressionTests.csproj -- .\bin\Release\net8.0-windows\win-x64\ScannerGuard.dll --no-ime
+          if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
+
+      - name: Publish compressed single EXE
+        shell: pwsh
+        run: |
+          dotnet publish -c Release -o .\publish -p:EnableCompressionInSingleFile=true
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
+          $files = @(Get-ChildItem .\publish -File)
+          if ($files.Count -ne 1 -or $files[0].Name -ne 'ScannerGuard.exe') {
+            throw 'Expected exactly one published file: ScannerGuard.exe.'
+          }
+          $hash = (Get-FileHash .\publish\ScannerGuard.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ScannerGuard.exe" | Set-Content .\publish\SHA256SUMS.txt -Encoding ascii
+
+      - name: Create release
+        shell: pwsh
+        run: |
+          $notes = @(
+            'Windows x64 self-contained, compressed single-file executable. No .NET or AutoHotkey installation required.'
+            ''
+            'Includes startup, heartbeat, power API and exception diagnostics with bounded rotation. Does not record keys or barcode contents.'
+            'Known limitation: Raw Input matching failures are diagnosed, not fixed in this version.'
+            ''
+            "Source commit: $env:GITHUB_SHA"
+            'Release build and regression tests passed. Focus-dependent IME test explicitly skipped on the hosted runner; hardware and MES acceptance tests remain manual.'
+            'SHA256SUMS.txt is provided to verify the downloaded executable.'
+          )
+          $notes | Set-Content .\release-notes.txt -Encoding utf8
+          gh release create $env:RELEASE_TAG .\publish\ScannerGuard.exe .\publish\SHA256SUMS.txt --target $env:GITHUB_SHA --title "ScannerGuard $env:RELEASE_TAG" --notes-file .\release-notes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release upload failed.' }
+          $releaseJson = gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify published release.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $exe = @($release.assets | Where-Object name -eq 'ScannerGuard.exe')
+          $checksum = @($release.assets | Where-Object name -eq 'SHA256SUMS.txt')
+          if ($release.draft -or $exe.Count -ne 1 -or $checksum.Count -ne 1 -or
+              $exe[0].size -ne (Get-Item .\publish\ScannerGuard.exe).Length -or
+              $checksum[0].size -ne (Get-Item .\publish\SHA256SUMS.txt).Length) {
+            throw 'Published release assets did not match the build output.'
+          }
+          "Release: $($release.html_url)" | Add-Content $env:GITHUB_STEP_SUMMARY

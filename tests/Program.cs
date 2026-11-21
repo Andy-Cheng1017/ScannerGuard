@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -10,7 +11,10 @@ internal static class RegressionTests
     [STAThread]
     static int Main(string[] args)
     {
+        if (args[0] == "--diagnostic-child")
+            return RunDiagnosticChild(args[1], args[2], args[3]);
         var product = Assembly.LoadFrom(Path.GetFullPath(args[0]));
+        VerifyDiagnostics(Path.GetFullPath(args[0]));
         var type = product.GetType("RawInputWindow", true)!;
         VerifyDeviceClassification(type);
         using (var scanner = new Replay(type))
@@ -87,13 +91,17 @@ internal static class RegressionTests
             Check(scanner.Keys.Count == 0, "Already-delivered Enter was duplicated.");
         }
         Console.WriteLine("PASS: ordinary keyboard Shift and already-passed Enter are not rewritten.");
-        VerifyImeCompletion(type);
+        if (args.Contains("--no-ime"))
+            Console.WriteLine("SKIP: focus-dependent IME test (--no-ime).");
+        else
+            VerifyImeCompletion(type);
         VerifyTrayAndPowerIntegration(product);
 
-        if (args.Length > 1)
+        string? tracePath = args.Skip(1).FirstOrDefault(arg => arg != "--no-ime");
+        if (tracePath != null)
         {
             Check(!Replay.CapsLock, "Turn Caps Lock off before replaying the browser trace.");
-            using var json = JsonDocument.Parse(File.ReadAllText(args[1]));
+            using var json = JsonDocument.Parse(File.ReadAllText(tracePath));
             using var scanner = new Replay(type);
             var expected = new StringBuilder();
             foreach (var item in json.RootElement.GetProperty("logs").EnumerateArray().OrderBy(e => e.GetProperty("seq").GetInt32()))
@@ -123,6 +131,108 @@ internal static class RegressionTests
     static void Check(bool success, string message)
     {
         if (!success) throw new InvalidOperationException(message);
+    }
+
+    static int RunDiagnosticChild(string productPath, string directory, string mode)
+    {
+        var product = Assembly.LoadFrom(productPath);
+        var diagnostics = product.GetType("Diagnostics", true)!;
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+        diagnostics.GetMethod("Initialize", flags)!.Invoke(null, new object[] { directory });
+        if (mode == "input-fatal")
+        {
+            using var scanner = new Replay(product.GetType("RawInputWindow", true)!);
+            scanner.Raw(0x41, 0x1E);
+            throw new InvalidOperationException("Expected unmatched scanner input to throw.");
+        }
+        if (mode == "fatal")
+        {
+            new Thread(() => throw new InvalidOperationException("diagnostic-child-test")).Start();
+            Thread.Sleep(Timeout.Infinite);
+        }
+        if (mode == "kill") Thread.Sleep(Timeout.Infinite);
+        diagnostics.GetMethod("Write", flags)!.Invoke(null,
+            new object[] { "HEARTBEAT", "uiResponsive=true keepAwakeRequested=true" });
+        diagnostics.GetMethod("Complete", flags)!.Invoke(null, null);
+        return 0;
+    }
+
+    static void VerifyDiagnostics(string productPath)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ScannerGuard-diagnostics-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            foreach (string mode in new[] { "normal", "fatal", "input-fatal", "kill", "rotate" })
+            {
+                string directory = Path.Combine(root, mode);
+                Directory.CreateDirectory(directory);
+                string path = Path.Combine(directory, "diagnostics.log");
+                if (mode == "rotate") File.WriteAllText(path, new string('x', 1024 * 1024));
+                var start = new ProcessStartInfo(Environment.ProcessPath!)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true
+                };
+                if (Path.GetFileNameWithoutExtension(Environment.ProcessPath) == "dotnet")
+                    start.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
+                foreach (string value in new[] { "--diagnostic-child", productPath, directory, mode })
+                    start.ArgumentList.Add(value);
+                using var process = Process.Start(start)!;
+                var stderr = process.StandardError.ReadToEndAsync();
+                var stdout = process.StandardOutput.ReadToEndAsync();
+                try
+                {
+                    if (mode == "kill")
+                    {
+                        var deadline = Environment.TickCount64 + 15000;
+                        while ((!File.Exists(path) || new FileInfo(path).Length == 0) &&
+                            !process.HasExited && Environment.TickCount64 < deadline)
+                            Thread.Sleep(20);
+                        Check(!process.HasExited && File.Exists(path) && new FileInfo(path).Length > 0,
+                            "Child did not persist START before forced termination.");
+                        process.Kill();
+                    }
+                    Check(process.WaitForExit(15000), $"Diagnostic child timed out: {mode}");
+                    string log = File.ReadAllText(path);
+                    Check(log.Contains("START") && log.Contains($"pid={process.Id}"), "Missing durable startup PID.");
+                    if (mode is "fatal" or "input-fatal")
+                    {
+                        Check(process.ExitCode != 0 && log.Contains("FATAL source=unhandled") &&
+                            log.Contains("RunDiagnosticChild"),
+                            "Unhandled exception was not persisted with stack trace.");
+                        if (mode == "fatal")
+                            Check(log.Contains("diagnostic-child-test"), "Missing unhandled exception message.");
+                        else
+                            Check(log.Contains("INPUT_MATCH_FAILED pendingCount=0") &&
+                                log.Contains("Scanner input could not be matched") &&
+                                log.Contains("HandlePassedScannerKey"),
+                                "Actual unmatched Raw Input failure did not leave its diagnostic evidence.");
+                    }
+                    else if (mode == "kill")
+                        Check(!log.Contains("EXIT "), "Forced kill incorrectly recorded a normal exit.");
+                    else
+                    {
+                        Check(process.ExitCode == 0, $"Diagnostic child failed: {stderr.GetAwaiter().GetResult()}");
+                        Check(log.Contains("HEARTBEAT") && log.Contains("EXIT reason=completed exitCode=0"),
+                            "Normal completion or heartbeat missing.");
+                    }
+                    if (mode == "rotate")
+                        Check(File.Exists(path + ".1") && new FileInfo(path).Length < 4096,
+                            "Log rotation did not retain the bounded previous file.");
+                }
+                finally
+                {
+                    if (!process.HasExited) { process.Kill(); process.WaitForExit(); }
+                    _ = stderr.GetAwaiter().GetResult();
+                    _ = stdout.GetAwaiter().GetResult();
+                }
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+        Console.WriteLine("PASS: child processes persist startup, heartbeat, normal exit, unhandled stack trace and bounded rotation; forced kill leaves no false clean exit.");
     }
 
     static void VerifyDeviceClassification(Type type)
@@ -157,6 +267,10 @@ internal static class RegressionTests
         context.ExitThread();
         Check(!tray.Visible, "Exit did not hide the tray icon.");
         Check((bool)setPower.Invoke(null, new object[] { false })!, "Could not restore normal power state.");
+        var disposedContext = (ApplicationContext)Activator.CreateInstance(type)!;
+        var disposedTray = (NotifyIcon)type.GetField("_tray", flags)!.GetValue(disposedContext)!;
+        disposedContext.Dispose();
+        Check(!disposedTray.Visible, "Exception-scope disposal did not remove the tray icon.");
         Console.WriteLine("PASS: single-EXE tray icon includes Exit and restores keep-awake state on exit.");
     }
 

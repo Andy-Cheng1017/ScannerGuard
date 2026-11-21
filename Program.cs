@@ -3,14 +3,20 @@ using System.Windows.Forms;
 
 using var instance = new Mutex(true, @"Local\ScannerGuard", out bool firstInstance);
 if (!firstInstance) return;
+Diagnostics.Initialize();
 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
 try
 {
-    Application.Run(new ScannerGuardApplicationContext());
+    using var context = new ScannerGuardApplicationContext();
+    Application.Run(context);
+    Diagnostics.Complete();
 }
 catch (Exception ex)
 {
-    MessageBox.Show(ex.Message, "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    Diagnostics.Fatal("main", ex);
+    Environment.ExitCode = 1;
+    MessageBox.Show($"{ex.Message}\n\nDiagnostics: {Diagnostics.LogDirectory}",
+        "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Error);
 }
 
 sealed class ScannerGuardApplicationContext : ApplicationContext
@@ -18,7 +24,9 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
     readonly RawInputWindow _window;
     readonly NotifyIcon _tray;
     readonly ToolStripMenuItem _status;
+    readonly System.Windows.Forms.Timer _heartbeat = new() { Interval = 60_000 };
     bool _keepAwake;
+    bool _stopped;
 
     public ScannerGuardApplicationContext()
     {
@@ -31,7 +39,14 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripMenuItem("重新自動偵測內建鍵盤", null,
             (_, _) => _window.UseAutomaticPrimary()));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => ExitThread()));
+        menu.Items.Add(new ToolStripMenuItem("開啟診斷資料夾", null, (_, _) =>
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                Diagnostics.LogDirectory) { UseShellExecute = true })));
+        menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) =>
+        {
+            Diagnostics.Write("EXIT_REQUEST", "source=tray");
+            ExitThread();
+        }));
 
         if (SetKeepAwake(true))
             _keepAwake = true;
@@ -47,6 +62,10 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
             Visible = true
         };
         UpdateKeyboardStatus(_window.KeyboardStatus);
+        _heartbeat.Tick += (_, _) => Diagnostics.Write("HEARTBEAT",
+            $"uiResponsive=true keepAwakeRequested={_keepAwake}");
+        _heartbeat.Start();
+        Diagnostics.Write("READY", $"keepAwakeRequested={_keepAwake}");
     }
 
     void UpdateKeyboardStatus(string status)
@@ -56,15 +75,37 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
 
     protected override void ExitThreadCore()
     {
-        _tray.Visible = false;
-        _tray.Dispose();
-        _window.Dispose();
-        if (_keepAwake) SetKeepAwake(false);
+        Shutdown();
         base.ExitThreadCore();
     }
 
-    internal static bool SetKeepAwake(bool enabled) =>
-        SetThreadExecutionState(enabled ? 0x80000003 : 0x80000000) != UIntPtr.Zero;
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Shutdown();
+        base.Dispose(disposing);
+    }
+
+    void Shutdown()
+    {
+        if (_stopped) return;
+        _stopped = true;
+        Diagnostics.Write("STOPPING", "disposing tray and input handler");
+        _heartbeat.Dispose();
+        _tray.Visible = false;
+        var menu = _tray.ContextMenuStrip;
+        _tray.Dispose();
+        menu?.Dispose();
+        _window.Dispose();
+        if (_keepAwake) SetKeepAwake(false);
+    }
+
+    internal static bool SetKeepAwake(bool enabled)
+    {
+        bool success = SetThreadExecutionState(enabled ? 0x80000003u : 0x80000000u) != UIntPtr.Zero;
+        int error = success ? 0 : Marshal.GetLastWin32Error();
+        Diagnostics.Write("POWER", $"enabled={enabled} success={success} win32Error={error}");
+        return success;
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern UIntPtr SetThreadExecutionState(uint flags);
@@ -264,6 +305,8 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         if (index < 0)
         {
             if (!scanner) return;
+            Diagnostics.Write("INPUT_MATCH_FAILED",
+                $"pendingCount={_passedKeys.Count} activeScan={Environment.TickCount64 <= _activeUntil}");
             throw new InvalidOperationException("Scanner input could not be matched to a keyboard event; stopping to avoid duplicate input.");
         }
         var passed = _passedKeys[index];
@@ -351,6 +394,7 @@ sealed class RawInputWindow : NativeWindow, IDisposable
 
     void BeginImeWarning(string? error = null)
     {
+        Diagnostics.Write("WARNING", error ?? "Could not confirm English IME mode.");
         // Do not display a modal dialog inside the raw-input or hook callback.
         var timer = new System.Windows.Forms.Timer { Interval = 500 };
         timer.Tick += (_, _) =>
@@ -395,6 +439,7 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             catch (Exception ex)
             {
                 // Never let an exception escape the unmanaged hook callback.
+                Diagnostics.Fatal("keyboard-hook", ex);
                 _inputFailed = true;
                 UnhookWindowsHookEx(_hook);
                 BeginImeWarning(ex.Message);

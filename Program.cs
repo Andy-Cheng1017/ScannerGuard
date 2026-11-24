@@ -15,13 +15,11 @@ catch (Exception ex)
 {
     Diagnostics.Fatal("main", ex);
     Environment.ExitCode = 1;
-    MessageBox.Show($"{ex.Message}\n\nDiagnostics: {Diagnostics.LogDirectory}",
-        "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Error);
 }
 
 sealed class ScannerGuardApplicationContext : ApplicationContext
 {
-    readonly RawInputWindow _window;
+    readonly RawInputWindow? _window;
     readonly NotifyIcon _tray;
     readonly ToolStripMenuItem _status;
     readonly System.Windows.Forms.Timer _heartbeat = new() { Interval = 60_000 };
@@ -31,17 +29,32 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
     public ScannerGuardApplicationContext()
     {
         _status = new ToolStripMenuItem { Enabled = false };
-        _window = new RawInputWindow(UpdateKeyboardStatus);
+        try { _window = new RawInputWindow(UpdateKeyboardStatus); }
+        catch (Exception ex)
+        {
+            Diagnostics.Write("INPUT_DISABLED", $"source=startup{Environment.NewLine}{ex}");
+            UpdateKeyboardStatus("掃描功能停止；請重新啟動並查看日誌");
+        }
         var menu = new ContextMenuStrip();
         menu.Items.Add(_status);
         menu.Items.Add(new ToolStripMenuItem("將下一個鍵盤設為一般鍵盤", null,
-            (_, _) => _window.SelectPrimaryOnNextKey()));
+            (_, _) => _window?.RunControlAction(() => _window.SelectPrimaryOnNextKey())));
         menu.Items.Add(new ToolStripMenuItem("重新自動偵測內建鍵盤", null,
-            (_, _) => _window.UseAutomaticPrimary()));
+            (_, _) => _window?.RunControlAction(() => _window.UseAutomaticPrimary())));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("開啟診斷資料夾", null, (_, _) =>
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                Diagnostics.LogDirectory) { UseShellExecute = true })));
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    Diagnostics.LogDirectory) { UseShellExecute = true });
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+            {
+                Diagnostics.Write("WARNING", $"Could not open diagnostics folder: {ex}");
+                UpdateKeyboardStatus("無法開啟診斷資料夾；請查看日誌");
+            }
+        }));
         menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) =>
         {
             Diagnostics.Write("EXIT_REQUEST", "source=tray");
@@ -51,8 +64,7 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
         if (SetKeepAwake(true))
             _keepAwake = true;
         else
-            MessageBox.Show("Could not prevent automatic sleep or display timeout.",
-                "ScannerGuard", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Diagnostics.Write("WARNING", "Could not prevent automatic sleep or display timeout.");
 
         _tray = new NotifyIcon
         {
@@ -61,15 +73,20 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true
         };
-        UpdateKeyboardStatus(_window.KeyboardStatus);
-        _heartbeat.Tick += (_, _) => Diagnostics.Write("HEARTBEAT",
-            $"uiResponsive=true keepAwakeRequested={_keepAwake}");
+        if (_window != null) UpdateKeyboardStatus(_window.KeyboardStatus);
+        _heartbeat.Tick += (_, _) =>
+        {
+            Diagnostics.Write("HEARTBEAT", $"uiResponsive=true keepAwakeRequested={_keepAwake}");
+            UpdateKeyboardStatus(_window?.KeyboardStatus ?? "掃描功能停止；請重新啟動並查看日誌");
+        };
         _heartbeat.Start();
         Diagnostics.Write("READY", $"keepAwakeRequested={_keepAwake}");
     }
 
     void UpdateKeyboardStatus(string status)
     {
+        if (Diagnostics.IsUnavailable) status += "；日誌寫入失敗";
+        if (!_keepAwake) status += "；防休眠未啟用";
         _status.Text = status.Length <= 80 ? status : status[..77] + "...";
     }
 
@@ -95,7 +112,7 @@ sealed class ScannerGuardApplicationContext : ApplicationContext
         var menu = _tray.ContextMenuStrip;
         _tray.Dispose();
         menu?.Dispose();
-        _window.Dispose();
+        _window?.Dispose();
         if (_keepAwake) SetKeepAwake(false);
     }
 
@@ -160,21 +177,31 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         _statusChanged = statusChanged;
         CreateHandle(new CreateParams { Parent = HWND_MESSAGE });
 
-        var rid = new RAWINPUTDEVICE
+        try
         {
-            usUsagePage = 0x01, usUsage = 0x06, // Generic Desktop / Keyboard
-            dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, // receive even when not focused
-            hwndTarget = Handle
-        };
-        if (!RegisterRawInputDevices(new[] { rid }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
-            throw new InvalidOperationException($"RegisterRawInputDevices failed: {Marshal.GetLastWin32Error()}");
+            var rid = new RAWINPUTDEVICE
+            {
+                usUsagePage = 0x01, usUsage = 0x06, // Generic Desktop / Keyboard
+                dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, // receive even when not focused
+                hwndTarget = Handle
+            };
+            if (!RegisterRawInputDevices(new[] { rid }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
+                throw new InvalidOperationException($"RegisterRawInputDevices failed: {Marshal.GetLastWin32Error()}");
 
-        _hookProc = HookProc;
-        _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
-        if (_hook == IntPtr.Zero)
-            throw new InvalidOperationException($"SetWindowsHookEx failed: {Marshal.GetLastWin32Error()}");
-        _englishTimer.Tick += OnEnglishTimerTick;
-        RefreshDevices();
+            _hookProc = HookProc;
+            _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, GetModuleHandle(null), 0);
+            if (_hook == IntPtr.Zero)
+                throw new InvalidOperationException($"SetWindowsHookEx failed: {Marshal.GetLastWin32Error()}");
+            _englishTimer.Tick += OnEnglishTimerTick;
+            RefreshDevices();
+        }
+        catch
+        {
+            if (_hook != IntPtr.Zero) UnhookWindowsHookEx(_hook);
+            _englishTimer.Dispose();
+            DestroyHandle();
+            throw;
+        }
     }
 
     public void Dispose()
@@ -186,18 +213,34 @@ sealed class RawInputWindow : NativeWindow, IDisposable
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_INPUT) HandleInput(m.LParam);
-        else if (m.Msg == WM_INPUT_DEVICE_CHANGE) RefreshDevices();
+        if (!_inputFailed)
+        {
+            try
+            {
+                if (m.Msg == WM_INPUT) HandleInput(m.LParam);
+                else if (m.Msg == WM_INPUT_DEVICE_CHANGE) RefreshDevices();
+            }
+            catch (Exception ex) { DisableInput("raw-input", ex); }
+        }
         base.WndProc(ref m);
     }
 
-    internal string KeyboardStatus => _selectingPrimary
+    internal string KeyboardStatus => _inputFailed
+        ? "掃描功能停止；請重新啟動並查看日誌"
+        : _selectingPrimary
         ? "等待指定一般鍵盤：請按它的任一鍵"
         : _primaryPaths.Count > 0
             ? $"一般鍵盤已辨識 ({_primaryPaths.Count} 個)；其他鍵盤作為掃描器"
             : "尚未辨識一般鍵盤；請用選單指定";
 
     internal void UpdateKeyboardStatus() => _statusChanged(KeyboardStatus);
+
+    internal void RunControlAction(Action action)
+    {
+        if (_inputFailed) return;
+        try { action(); }
+        catch (Exception ex) { DisableInput("keyboard-settings", ex); }
+    }
 
     internal void SelectPrimaryOnNextKey()
     {
@@ -307,7 +350,7 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             if (!scanner) return;
             Diagnostics.Write("INPUT_MATCH_FAILED",
                 $"pendingCount={_passedKeys.Count} activeScan={Environment.TickCount64 <= _activeUntil}");
-            throw new InvalidOperationException("Scanner input could not be matched to a keyboard event; stopping to avoid duplicate input.");
+            return;
         }
         var passed = _passedKeys[index];
         _passedKeys.RemoveAt(index);
@@ -367,8 +410,12 @@ sealed class RawInputWindow : NativeWindow, IDisposable
 
     void OnEnglishTimerTick(object? sender, EventArgs e)
     {
-        _englishTimer.Stop();
-        if (!_inputFailed) EnsureEnglish();
+        try
+        {
+            _englishTimer.Stop();
+            if (!_inputFailed) EnsureEnglish();
+        }
+        catch (Exception ex) { DisableInput("ime-timer", ex); }
     }
 
     static IntPtr GetFocusedWindow(IntPtr foreground)
@@ -387,26 +434,21 @@ sealed class RawInputWindow : NativeWindow, IDisposable
         if ((!sameTarget || !SetImeEnglish(_scanForeground)) && !_imeWarningShown)
         {
             _imeWarningShown = true;
-            BeginImeWarning(sameTarget ? null :
-                "Input focus changed during scanning. English mode was not forced on the new target.");
+            Diagnostics.Write("WARNING", sameTarget
+                ? "Could not confirm English IME mode."
+                : "Input focus changed during scanning. English mode was not forced on the new target.");
         }
     }
 
-    void BeginImeWarning(string? error = null)
+    void DisableInput(string source, Exception error)
     {
-        Diagnostics.Write("WARNING", error ?? "Could not confirm English IME mode.");
-        // Do not display a modal dialog inside the raw-input or hook callback.
-        var timer = new System.Windows.Forms.Timer { Interval = 500 };
-        timer.Tick += (_, _) =>
-        {
-            timer.Dispose();
-            MessageBox.Show(error ?? ("Could not confirm Microsoft Bopomofo switched to English. " +
-                "The target may not support IMM control, or may be running as administrator. " +
-                "Barcode interception remains active."), "ScannerGuard",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            if (_inputFailed) Application.ExitThread();
-        };
-        timer.Start();
+        if (_inputFailed) return;
+        _inputFailed = true;
+        _englishTimer.Stop();
+        if (_hook != IntPtr.Zero && !UnhookWindowsHookEx(_hook))
+            Diagnostics.Write("WARNING", $"Could not remove keyboard hook: {Marshal.GetLastWin32Error()}");
+        Diagnostics.Write("INPUT_DISABLED", $"source={source}{Environment.NewLine}{error}");
+        UpdateKeyboardStatus();
     }
 
     internal static bool SetImeEnglish(IntPtr foreground)
@@ -439,10 +481,7 @@ sealed class RawInputWindow : NativeWindow, IDisposable
             catch (Exception ex)
             {
                 // Never let an exception escape the unmanaged hook callback.
-                Diagnostics.Fatal("keyboard-hook", ex);
-                _inputFailed = true;
-                UnhookWindowsHookEx(_hook);
-                BeginImeWarning(ex.Message);
+                DisableInput("keyboard-hook", ex);
             }
             if (swallow) return (IntPtr)1;
         }

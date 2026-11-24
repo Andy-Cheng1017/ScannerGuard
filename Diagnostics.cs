@@ -7,7 +7,7 @@ internal static class Diagnostics
     static string? _path;
     static bool _completed;
     static bool _faulted;
-    static bool _writeWarningShown;
+    internal static bool IsUnavailable { get; private set; }
 
     internal static string LogDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ScannerGuard");
@@ -44,17 +44,12 @@ internal static class Diagnostics
                     File.Move(_path, _path + ".1", overwrite: true);
                 File.AppendAllText(_path,
                     $"{DateTimeOffset.Now:O} pid={Environment.ProcessId} uptimeMs={Environment.TickCount64 - StartedAt} {kind} {details}{Environment.NewLine}");
+                IsUnavailable = false;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 Trace.TraceError($"ScannerGuard diagnostics unavailable: {ex}");
-                if (_writeWarningShown) return;
-                _writeWarningShown = true;
-                // Queue the warning; never pump window messages inside an input callback.
-                ThreadPool.QueueUserWorkItem(_ => System.Windows.Forms.MessageBox.Show(
-                    $"Cannot write ScannerGuard diagnostics to {_path}.{Environment.NewLine}{ex.Message}",
-                    "ScannerGuard diagnostics", System.Windows.Forms.MessageBoxButtons.OK,
-                    System.Windows.Forms.MessageBoxIcon.Warning));
+                IsUnavailable = true;
             }
         }
     }

@@ -14,8 +14,18 @@ internal static class RegressionTests
         if (args[0] == "--diagnostic-child")
             return RunDiagnosticChild(args[1], args[2], args[3]);
         var product = Assembly.LoadFrom(Path.GetFullPath(args[0]));
-        VerifyDiagnostics(Path.GetFullPath(args[0]));
         var type = product.GetType("RawInputWindow", true)!;
+        using (var scanner = new Replay(type))
+        {
+            scanner.Raw(0x41, 0x1E);
+            Check(scanner.Text == "" && scanner.Keys.Count == 0,
+                "Unmatched scanner input must not inject or delete text.");
+            scanner.Expire();
+            scanner.Type("12");
+            Check(scanner.Text == "12", "A later scanner input did not recover.");
+        }
+        Console.WriteLine("PASS: unmatched Raw Input does not delete or inject text and a later scan can recover.");
+        VerifyDiagnostics(Path.GetFullPath(args[0]));
         VerifyDeviceClassification(type);
         using (var scanner = new Replay(type))
         {
@@ -143,7 +153,24 @@ internal static class RegressionTests
         {
             using var scanner = new Replay(product.GetType("RawInputWindow", true)!);
             scanner.Raw(0x41, 0x1E);
-            throw new InvalidOperationException("Expected unmatched scanner input to throw.");
+            Check(scanner.Text == "" && scanner.Keys.Count == 0,
+                "Unmatched scanner input must not inject or delete text.");
+            scanner.Expire();
+            scanner.Type("12");
+            Check(scanner.Text == "12", "A later scanner input did not recover.");
+        }
+        if (mode == "ime-warning")
+        {
+            using var scanner = new Replay(product.GetType("RawInputWindow", true)!);
+            scanner.Instance.GetType().GetMethod("EnsureEnglish",
+                BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(scanner.Instance, null);
+            var until = Environment.TickCount64 + 800;
+            while (Environment.TickCount64 < until) { Application.DoEvents(); Thread.Sleep(10); }
+        }
+        if (mode == "hook-error")
+        {
+            using var scanner = new Replay(product.GetType("RawInputWindow", true)!);
+            scanner.VerifyHookFailure();
         }
         if (mode == "fatal")
         {
@@ -163,7 +190,7 @@ internal static class RegressionTests
         Directory.CreateDirectory(root);
         try
         {
-            foreach (string mode in new[] { "normal", "fatal", "input-fatal", "kill", "rotate" })
+            foreach (string mode in new[] { "normal", "fatal", "input-fatal", "ime-warning", "hook-error", "kill", "rotate" })
             {
                 string directory = Path.Combine(root, mode);
                 Directory.CreateDirectory(directory);
@@ -198,18 +225,12 @@ internal static class RegressionTests
                     Check(process.WaitForExit(15000), $"Diagnostic child timed out: {mode}");
                     string log = File.ReadAllText(path);
                     Check(log.Contains("START") && log.Contains($"pid={process.Id}"), "Missing durable startup PID.");
-                    if (mode is "fatal" or "input-fatal")
+                    if (mode == "fatal")
                     {
                         Check(process.ExitCode != 0 && log.Contains("FATAL source=unhandled") &&
                             log.Contains("RunDiagnosticChild"),
                             "Unhandled exception was not persisted with stack trace.");
-                        if (mode == "fatal")
-                            Check(log.Contains("diagnostic-child-test"), "Missing unhandled exception message.");
-                        else
-                            Check(log.Contains("INPUT_MATCH_FAILED pendingCount=0") &&
-                                log.Contains("Scanner input could not be matched") &&
-                                log.Contains("HandlePassedScannerKey"),
-                                "Actual unmatched Raw Input failure did not leave its diagnostic evidence.");
+                        Check(log.Contains("diagnostic-child-test"), "Missing unhandled exception message.");
                     }
                     else if (mode == "kill")
                         Check(!log.Contains("EXIT "), "Forced kill incorrectly recorded a normal exit.");
@@ -218,6 +239,15 @@ internal static class RegressionTests
                         Check(process.ExitCode == 0, $"Diagnostic child failed: {stderr.GetAwaiter().GetResult()}");
                         Check(log.Contains("HEARTBEAT") && log.Contains("EXIT reason=completed exitCode=0"),
                             "Normal completion or heartbeat missing.");
+                        if (mode == "input-fatal")
+                            Check(log.Contains("INPUT_MATCH_FAILED pendingCount=0"),
+                                "Unmatched Raw Input did not leave diagnostic evidence.");
+                        if (mode == "ime-warning")
+                            Check(log.Contains("WARNING Input focus changed"),
+                                "IME warning was not logged.");
+                        if (mode == "hook-error")
+                            Check(log.Contains("INPUT_DISABLED source=keyboard-hook") &&
+                                log.Contains("simulated send failure"), "Hook failure was not logged.");
                     }
                     if (mode == "rotate")
                         Check(File.Exists(path + ".1") && new FileInfo(path).Length < 4096,
@@ -264,6 +294,16 @@ internal static class RegressionTests
             "Tray menu does not expose Exit.");
         var setPower = type.GetMethod("SetKeepAwake", flags)!;
         Check((bool)setPower.Invoke(null, new object[] { true })!, "Could not set keep-awake state.");
+        object inputWindow = type.GetField("_window", flags)!.GetValue(context)!;
+        var wndProc = inputWindow.GetType().GetMethod("WndProc", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var invalidInput = Message.Create(IntPtr.Zero, 0x00FF, IntPtr.Zero, IntPtr.Zero);
+        wndProc.Invoke(inputWindow, new object[] { invalidInput });
+        Check((bool)inputWindow.GetType().GetField("_inputFailed", flags)!.GetValue(inputWindow)!,
+            "Raw Input errors did not disable unsafe interception.");
+        Check(tray.Visible && (bool)type.GetField("_keepAwake", flags)!.GetValue(context)!,
+            "Raw Input error terminated tray or keep-awake state.");
+        var status = (ToolStripMenuItem)type.GetField("_status", flags)!.GetValue(context)!;
+        Check(status.Text?.Contains("掃描功能停止") == true, "Tray does not show degraded input status.");
         context.ExitThread();
         Check(!tray.Visible, "Exit did not hide the tray icon.");
         Check((bool)setPower.Invoke(null, new object[] { false })!, "Could not restore normal power state.");
@@ -347,6 +387,7 @@ internal static class RegressionTests
             Set("_sendCharacter", (Action<char>)(c => _text.Append(c)));
             Set("_sendKeyPress", (Action<ushort>)(vk => Keys.Add(vk)));
             Set("_releaseKey", (Action<ushort>)(vk => Releases.Add(vk)));
+            Set("_statusChanged", (Action<string>)(_ => { }));
             Set("_enUs", LoadKeyboardLayout("00000409", 0));
             _route = type.GetMethod("ShouldSwallow", Fields)!;
             _raw = type.GetMethod("HandlePassedScannerKey", Fields)!;
@@ -379,6 +420,30 @@ internal static class RegressionTests
         {
             _inScan = false;
             Set("_activeUntil", 0L);
+        }
+
+        public void VerifyHookFailure()
+        {
+            string status = "";
+            Set("_statusChanged", (Action<string>)(value => status = value));
+            Set("_sendCharacter", (Action<char>)(_ => throw new InvalidOperationException("simulated send failure")));
+            Set("_activeUntil", Environment.TickCount64 + 10000);
+            object key = Activator.CreateInstance(_keyType)!;
+            _keyType.GetField("vkCode")!.SetValue(key, 0x41u);
+            _keyType.GetField("scanCode")!.SetValue(key, 0x1Eu);
+            IntPtr buffer = Marshal.AllocHGlobal(Marshal.SizeOf(_keyType));
+            try
+            {
+                Marshal.StructureToPtr(key, buffer, false);
+                var hook = _type.GetMethod("HookProc", Fields)!;
+                var result = (IntPtr)hook.Invoke(_instance, new object[] { 0, (IntPtr)0x100, buffer })!;
+                Check(result == IntPtr.Zero, "Failing hook swallowed the input.");
+                Check((bool)_type.GetField("_inputFailed", Fields)!.GetValue(_instance)! &&
+                    status.Contains("掃描功能停止"), "Hook failure did not show degraded status.");
+                result = (IntPtr)hook.Invoke(_instance, new object[] { 0, (IntPtr)0x100, buffer })!;
+                Check(result == IntPtr.Zero, "Disabled hook did not pass through later input.");
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
         }
 
         public void Type(string text)

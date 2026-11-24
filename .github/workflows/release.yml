@@ -76,7 +76,7 @@ jobs:
             'Windows x64 self-contained, compressed single-file executable. No .NET or AutoHotkey installation required.'
             ''
             'Includes startup, heartbeat, power API and exception diagnostics with bounded rotation. Does not record keys or barcode contents.'
-            'Known limitation: Raw Input matching failures are diagnosed, not fixed in this version.'
+            'Unmatched Raw Input is logged without rewriting that key; affected scans may be incorrect. Other input errors disable interception until restart.'
             ''
             "Source commit: $env:GITHUB_SHA"
             'Release build and regression tests passed. Focus-dependent IME test explicitly skipped on the hosted runner; hardware and MES acceptance tests remain manual.'
